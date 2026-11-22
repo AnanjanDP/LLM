@@ -2,8 +2,7 @@ services:
   redis:
     image: redis:7-alpine
     container_name: rag_redis
-    ports:
-      - "6379:6379"
+    # Not published to the host: only the app container needs it.
     volumes:
       - redis-data:/data
     restart: unless-stopped
@@ -21,10 +20,12 @@ services:
     ports:
       - "8000:8000"
     environment:
+      - ENVIRONMENT=production
       - PROJECT_NAME=RAG Intelligence Platform
       - API_V1_STR=/api/v1
-      - SECRET_KEY=dev-secret-key-change-in-production-min-32-characters
-      - DATABASE_URL=sqlite+aiosqlite:///./app.db
+      - SECRET_KEY=${SECRET_KEY:?Set SECRET_KEY in .env (see .env.example)}
+      - CORS_ORIGINS=${CORS_ORIGINS:-["http://localhost:8000"]}
+      - DATABASE_URL=sqlite+aiosqlite:///./data/app.db
       - REDIS_URL=redis://redis:6379/0
       - DEFAULT_LLM_PROVIDER=groq
       - DEFAULT_LLM_MODEL=llama-3.3-70b-versatile

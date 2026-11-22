@@ -1,10 +1,13 @@
 .env
 *.env
+!.env.example
+!*.env.example
 secrets.env
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
+.venv/
 .pytest_cache/
 .coverage
 htmlcov/
@@ -16,6 +19,8 @@ build/
 *.sqlite3
 faiss.index
 documents.npy
+documents.json
+backend/data/
 *.pth
 .DS_Store
-*.log
+*.log

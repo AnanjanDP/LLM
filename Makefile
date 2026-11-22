@@ -1,4 +1,4 @@
-.PHONY: install run-backend run-frontend test build docker-build docker-run help
+.PHONY: install run-backend run-frontend test benchmark lint build docker-build docker-run help
 
 help:
 	@echo "Available commands:"
@@ -6,6 +6,8 @@ help:
 	@echo "  make run-backend  - Start FastAPI backend dev server"
 	@echo "  make run-frontend - Start Vite frontend dev server"
 	@echo "  make test         - Run backend pytest test suite"
+	@echo "  make benchmark    - Run the retrieval benchmark for every strategy"
+	@echo "  make lint         - Lint the frontend"
 	@echo "  make build        - Build production frontend bundle"
 	@echo "  make docker-build - Build Docker container"
 	@echo "  make docker-run   - Run containerized application via Docker Compose"
@@ -22,6 +24,12 @@ run-frontend:
 
 test:
 	cd backend && python -m pytest
+
+benchmark:
+	cd backend && python scripts/run_benchmark.py
+
+lint:
+	cd frontend && npm run lint
 
 build:
 	cd frontend && npm run build
