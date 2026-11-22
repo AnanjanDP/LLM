@@ -5,12 +5,12 @@ import ChatMessage from "./components/ChatMessage";
 import ChatInput from "./components/ChatInput";
 import AuthModal from "./components/AuthModal";
 import EvalModal from "./components/EvalModal";
-import { chatAPI, streamChatMessage, authAPI } from "./services/api";
+import { chatAPI, streamChatMessage, authAPI, guestSessions, newSessionId } from "./services/api";
 import { Sparkles, MessageSquare, Zap, Cpu, Terminal, Layers } from "lucide-react";
 
 export default function App() {
   const [conversations, setConversations] = useState([]);
-  const [activeSessionId, setActiveSessionId] = useState("default");
+  const [activeSessionId, setActiveSessionId] = useState(() => newSessionId());
   const [messages, setMessages] = useState([]);
   const [loading, setLoading] = useState(false);
   const [useRag, setUseRag] = useState(true);
@@ -37,7 +37,7 @@ export default function App() {
 
   // Load specific conversation messages when session changes manually
   const loadConversationMessages = async (id) => {
-    if (!id || id === "default") {
+    if (!id) {
       setMessages([]);
       return;
     }
@@ -68,7 +68,7 @@ export default function App() {
       try {
         const res = await authAPI.getMe();
         setUser(res.data);
-      } catch (e) {
+      } catch {
         localStorage.removeItem("token");
       }
     }
@@ -76,7 +76,9 @@ export default function App() {
 
   const loadConversations = async () => {
     try {
-      const res = await chatAPI.listConversations();
+      // A signed-in user's conversations come from the account; a guest's from the ids this browser remembers.
+      const guestIds = localStorage.getItem("token") ? [] : guestSessions.get();
+      const res = await chatAPI.listConversations(guestIds);
       setConversations(res.data || []);
     } catch (err) {
       console.error("Failed to load conversations", err);
@@ -85,14 +87,14 @@ export default function App() {
 
   const handleNewChat = () => {
     if (loading) return;
-    const newId = `session-${Date.now()}`;
-    setActiveSessionId(newId);
+    setActiveSessionId(newSessionId());
     setMessages([]);
   };
 
   const handleDeleteSession = async (id) => {
     try {
       await chatAPI.deleteConversation(id);
+      guestSessions.remove(id);
       setConversations((prev) => prev.filter((c) => c.id !== id));
       if (activeSessionId === id) {
         handleNewChat();
@@ -124,8 +126,9 @@ export default function App() {
         currentSession,
         { provider, useRag },
         (meta) => {
-          if (meta.conversation_id && meta.conversation_id !== activeSessionId) {
-            setActiveSessionId(meta.conversation_id);
+          if (meta.conversation_id) {
+            guestSessions.add(meta.conversation_id);
+            if (meta.conversation_id !== activeSessionId) setActiveSessionId(meta.conversation_id);
           }
           if (meta.sources) {
             assistantMsg.sources = meta.sources;
@@ -185,10 +188,11 @@ export default function App() {
         setMessages((prev) => [...prev, botMsg]);
 
         if (res.data.conversation_id) {
+          guestSessions.add(res.data.conversation_id);
           setActiveSessionId(res.data.conversation_id);
         }
         loadConversations();
-      } catch (err) {
+      } catch {
         setErrorToast("Error connecting to backend server.");
         setMessages((prev) => [
           ...prev,
@@ -218,6 +222,10 @@ export default function App() {
           onLogout={() => {
             localStorage.removeItem("token");
             setUser(null);
+            setConversations([]);
+            setMessages([]);
+            setActiveSessionId(newSessionId());
+            loadConversations();
           }}
           onRunEval={() => setEvalModalOpen(true)}
           currentProvider={provider}
@@ -296,7 +304,10 @@ export default function App() {
       <AuthModal
         isOpen={authModalOpen}
         onClose={() => setAuthModalOpen(false)}
-        onAuthSuccess={(u) => setUser(u)}
+        onAuthSuccess={(u) => {
+          setUser(u);
+          loadConversations();
+        }}
       />
 
       <EvalModal

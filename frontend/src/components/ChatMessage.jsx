@@ -25,7 +25,7 @@ function getRenderableText(rawContent) {
     else {
       try {
         str = JSON.stringify(rawContent, null, 2);
-      } catch (e) {
+      } catch {
         str = String(rawContent);
       }
     }

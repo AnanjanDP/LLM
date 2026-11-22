@@ -6,7 +6,6 @@ export default function EvalModal({ isOpen, onClose }) {
   const [loading, setLoading] = useState(false);
   const [evalData, setEvalData] = useState(null);
   const [systemMetrics, setSystemMetrics] = useState(null);
-  const [pastExperiments, setPastExperiments] = useState([]);
   const [errorMsg, setErrorMsg] = useState("");
 
   const [retrievalMode, setRetrievalMode] = useState("hybrid");
@@ -17,7 +16,6 @@ export default function EvalModal({ isOpen, onClose }) {
     if (isOpen) {
       setErrorMsg("");
       fetchSystemMetrics();
-      fetchPastExperiments();
     }
   }, [isOpen]);
 
@@ -25,15 +23,6 @@ export default function EvalModal({ isOpen, onClose }) {
     try {
       const res = await evalAPI.getSystemMetrics();
       setSystemMetrics(res.data);
-    } catch (err) {
-      console.error(err);
-    }
-  };
-
-  const fetchPastExperiments = async () => {
-    try {
-      const res = await evalAPI.listExperiments();
-      setPastExperiments(res.data);
     } catch (err) {
       console.error(err);
     }
@@ -51,10 +40,13 @@ export default function EvalModal({ isOpen, onClose }) {
       });
       setEvalData(res.data);
       fetchSystemMetrics();
-      fetchPastExperiments();
     } catch (err) {
       console.error(err);
-      setErrorMsg(err.response?.data?.detail || err.message || "Failed to run evaluation benchmark.");
+      setErrorMsg(
+        err.response?.status === 401
+          ? "Sign in to run the benchmark."
+          : err.response?.data?.error || err.response?.data?.detail || err.message || "Failed to run evaluation benchmark."
+      );
     } finally {
       setLoading(false);
     }
@@ -187,15 +179,15 @@ export default function EvalModal({ isOpen, onClose }) {
                 </div>
               </div>
               <div className="glass-panel" style={{ padding: "10px", textAlign: "center" }}>
-                <div style={{ fontSize: "0.7rem", color: "var(--text-dim)" }}>Faithfulness</div>
+                <div style={{ fontSize: "0.7rem", color: "var(--text-dim)" }} title="Word overlap between the answer and the retrieved context (a proxy, not a judgement)">Faithfulness (proxy)</div>
                 <div style={{ fontSize: "1.3rem", fontWeight: "700", color: "#38bdf8" }}>
-                  {(evalData.generation_metrics.faithfulness * 100).toFixed(0)}%
+                  {evalData.generation_metrics.faithfulness == null ? "n/a" : `${(evalData.generation_metrics.faithfulness * 100).toFixed(0)}%`}
                 </div>
               </div>
               <div className="glass-panel" style={{ padding: "10px", textAlign: "center" }}>
-                <div style={{ fontSize: "0.7rem", color: "var(--text-dim)" }}>Answer Relevance</div>
+                <div style={{ fontSize: "0.7rem", color: "var(--text-dim)" }} title="Share of the question's words found in the answer (a proxy)">Answer Relevance (proxy)</div>
                 <div style={{ fontSize: "1.3rem", fontWeight: "700", color: "#a78bfa" }}>
-                  {(evalData.generation_metrics.answer_relevance * 100).toFixed(0)}%
+                  {evalData.generation_metrics.answer_relevance == null ? "n/a" : `${(evalData.generation_metrics.answer_relevance * 100).toFixed(0)}%`}
                 </div>
               </div>
             </div>

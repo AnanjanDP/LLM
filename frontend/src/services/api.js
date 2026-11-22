@@ -1,6 +1,35 @@
 import axios from "axios";
 
-const API_BASE_URL = import.meta.env.VITE_API_URL || "http://127.0.0.1:8000/api/v1";
+// In development the API runs on its own port; in a production build it is served from the same origin.
+const API_BASE_URL =
+  import.meta.env.VITE_API_URL || (import.meta.env.DEV ? "http://127.0.0.1:8000/api/v1" : "/api/v1");
+
+// Conversation ids are the only thing that protects a guest's chat history, so they must be unguessable.
+export const newSessionId = () =>
+  typeof crypto !== "undefined" && crypto.randomUUID
+    ? crypto.randomUUID()
+    : Array.from(crypto.getRandomValues(new Uint8Array(16)), (b) => b.toString(16).padStart(2, "0")).join("");
+
+// Guests have no account, so the browser remembers which conversations are theirs.
+const GUEST_KEY = "guest_sessions";
+export const guestSessions = {
+  get: () => {
+    try {
+      const ids = JSON.parse(localStorage.getItem(GUEST_KEY) || "[]");
+      return Array.isArray(ids) ? ids.filter((i) => typeof i === "string") : [];
+    } catch {
+      return [];
+    }
+  },
+  add: (id) => {
+    if (!id) return;
+    const ids = guestSessions.get().filter((i) => i !== id);
+    localStorage.setItem(GUEST_KEY, JSON.stringify([id, ...ids].slice(0, 50)));
+  },
+  remove: (id) => {
+    localStorage.setItem(GUEST_KEY, JSON.stringify(guestSessions.get().filter((i) => i !== id)));
+  },
+};
 
 const apiClient = axios.create({
   baseURL: API_BASE_URL,
@@ -37,26 +66,27 @@ export const chatAPI = {
       prompt_version: options.promptVersion || "v1.0",
     }),
 
-  listConversations: () => apiClient.get("/chat/conversations"),
+  // Signed in: the server lists your conversations. Guest: pass the ids this browser created.
+  listConversations: (guestIds = []) =>
+    apiClient.get("/chat/conversations", guestIds.length ? { params: { ids: guestIds.join(",") } } : undefined),
   getConversation: (conversationId) => apiClient.get(`/chat/conversations/${conversationId}`),
   deleteConversation: (conversationId) => apiClient.delete(`/chat/conversations/${conversationId}`),
 };
 
 export const documentAPI = {
-  uploadDocument: (file, chunkStrategy = "word", chunkSize = 200, chunkOverlap = 40, sessionId = null) => {
+  // A document belongs to one conversation, so the session id is required.
+  uploadDocument: (file, chunkStrategy = "word", chunkSize = 200, chunkOverlap = 40, sessionId) => {
+    if (!sessionId) return Promise.reject(new Error("A conversation is required to upload a document."));
     const formData = new FormData();
     formData.append("file", file);
-    const sessionParam = sessionId ? `&session_id=${encodeURIComponent(sessionId)}` : "";
     return apiClient.post(
-      `/upload-doc?chunk_strategy=${chunkStrategy}&chunk_size=${chunkSize}&chunk_overlap=${chunkOverlap}${sessionParam}`,
+      `/upload-doc?chunk_strategy=${chunkStrategy}&chunk_size=${chunkSize}&chunk_overlap=${chunkOverlap}&session_id=${encodeURIComponent(sessionId)}`,
       formData,
       { headers: { "Content-Type": "multipart/form-data" } }
     );
   },
-  clearDocuments: (sessionId = null) => {
-    const param = sessionId ? `?session_id=${encodeURIComponent(sessionId)}` : "";
-    return apiClient.delete(`/clear-documents${param}`);
-  },
+  // Removes the documents of one conversation (there is no "clear everything").
+  clearDocuments: (sessionId) => apiClient.delete(`/clear-documents?session_id=${encodeURIComponent(sessionId)}`),
 };
 
 
@@ -153,7 +183,7 @@ export const streamChatMessage = async (
         } else if (data.content !== undefined && onToken) {
           onToken(data.content);
         }
-      } catch (e) {
+      } catch {
         // Fallback for non-JSON text stream tokens (ignoring raw SSE framing errors)
         if (onToken && !jsonStr.startsWith("{") && !jsonStr.startsWith("[")) {
           onToken(jsonStr);
