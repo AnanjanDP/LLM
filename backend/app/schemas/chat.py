@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import List, Optional, Dict, Any
+from typing import List, Literal, Optional, Dict, Any
 from pydantic import BaseModel, Field, ConfigDict
 
 
@@ -12,14 +12,14 @@ class SourceCitation(BaseModel):
 
 class ChatRequest(BaseModel):
     query: str = Field(..., min_length=1, max_length=4096, description="User question or prompt")
-    session_id: Optional[str] = Field(default="default", description="Conversation session ID")
-    provider: Optional[str] = Field(default=None, description="LLM provider ('groq', 'mock')")
-    model: Optional[str] = Field(default=None, description="LLM model name")
+    session_id: Optional[str] = Field(default="default", max_length=64, description="Conversation session ID")
+    provider: Optional[Literal["groq", "mock"]] = Field(default=None, description="LLM provider ('groq', 'mock')")
+    model: Optional[str] = Field(default=None, max_length=100, description="LLM model name")
     use_rag: bool = Field(default=True, description="Enable context retrieval")
-    retrieval_mode: Optional[str] = Field(default="hybrid", description="Retrieval mode ('vector', 'bm25', 'hybrid')")
+    retrieval_mode: Literal["vector", "bm25", "hybrid"] = Field(default="hybrid", description="Retrieval mode")
     use_reranker: Optional[bool] = Field(default=False, description="Enable Cross-Encoder reranking stage")
-    top_k: Optional[int] = Field(default=4, description="Top K context snippets")
-    prompt_version: Optional[str] = Field(default="v1.0", description="Prompt template version ('v1.0', 'v1.1_strict', 'v2.0_cot')")
+    top_k: int = Field(default=4, ge=1, le=20, description="Top K context snippets")
+    prompt_version: Optional[str] = Field(default="v1.0", max_length=50, description="Prompt template version ('v1.0', 'v1.1_strict', 'v2.0_cot')")
     stream: bool = Field(default=False, description="Enable SSE streaming response")
 
 

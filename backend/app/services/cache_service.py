@@ -1,6 +1,6 @@
 import json
 import hashlib
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any
 from app.core.config import settings
 from app.core.logging import logger
 
@@ -9,9 +9,17 @@ try:
 except ImportError:
     redis = None
 
+KEY_PREFIX = "rag:"
+
 
 class RedisCacheService:
-    """Production Redis caching service for queries, embeddings, and context with statistics tracking."""
+    """Redis response cache for chat queries, with hit/miss statistics.
+
+    The cache key covers everything that can change the answer: query, retrieval mode, model, provider,
+    prompt version, top-k, reranking, the conversation, and the version of the document index. Leaving any of
+    them out would serve one setting's answer to another, or serve an answer computed from documents that
+    have since been replaced.
+    """
 
     def __init__(self):
         self.redis_client = None
@@ -23,7 +31,7 @@ class RedisCacheService:
     def _init_redis(self):
         """Attempt connection to Redis server."""
         if not self.enabled or redis is None:
-            logger.info("Redis cache disabled or redis-py not installed. Operating in-memory cache fallback mode.")
+            logger.info("Redis cache disabled or redis-py not installed. Responses will not be cached.")
             return
 
         try:
@@ -32,27 +40,26 @@ class RedisCacheService:
             )
             client.ping()
             self.redis_client = client
-            logger.info(f"Connected to Redis cache at {settings.REDIS_URL}")
+            logger.info("Connected to Redis cache.")
         except Exception as e:
             logger.warning(f"Could not connect to Redis server ({e}). Operating without Redis cache.")
             self.redis_client = None
 
-    def _hash_key(self, prefix: str, key_str: str) -> str:
-        """Create deterministic SHA256 cache key."""
-        hashed = hashlib.sha256(key_str.encode("utf-8")).hexdigest()
-        return f"rag:{prefix}:{hashed}"
+    def _key(self, **fields: Any) -> str:
+        """Deterministic SHA256 cache key over all fields."""
+        canonical = json.dumps(fields, sort_keys=True, default=str)
+        return f"{KEY_PREFIX}query:{hashlib.sha256(canonical.encode('utf-8')).hexdigest()}"
 
-    def get_query_cache(self, query: str, mode: str, model: str, session_id: str = None) -> Optional[Dict[str, Any]]:
-        """Retrieve cached RAG response for query + parameters + session."""
+    def get_query_cache(self, **fields: Any) -> Optional[Dict[str, Any]]:
+        """Retrieve a cached response for exactly these parameters."""
         if not self.redis_client:
             return None
 
-        cache_key = self._hash_key("query", f"{query}:{mode}:{model}:{session_id or 'default'}")
+        key = self._key(**fields)
         try:
-            val = self.redis_client.get(cache_key)
+            val = self.redis_client.get(key)
             if val:
                 self.hits += 1
-                logger.info(f"Redis Cache HIT for key {cache_key[:20]}...")
                 return json.loads(val)
             self.misses += 1
             return None
@@ -61,47 +68,42 @@ class RedisCacheService:
             self.misses += 1
             return None
 
-    def set_query_cache(
-        self, query: str, mode: str, model: str, data: Dict[str, Any], ttl: int = None, session_id: str = None
-    ) -> bool:
-        """Store RAG response in Redis with TTL."""
+    def set_query_cache(self, data: Dict[str, Any], ttl: int = None, **fields: Any) -> bool:
+        """Store a response in Redis with TTL."""
         if not self.redis_client:
             return False
 
-        cache_key = self._hash_key("query", f"{query}:{mode}:{model}:{session_id or 'default'}")
-        ttl_seconds = ttl or settings.CACHE_TTL_SECONDS
         try:
-            self.redis_client.setex(cache_key, ttl_seconds, json.dumps(data))
+            self.redis_client.setex(self._key(**fields), ttl or settings.CACHE_TTL_SECONDS, json.dumps(data))
             return True
         except Exception as e:
             logger.error(f"Redis set error: {e}")
             return False
 
     def clear_cache(self) -> bool:
-        """Flush query cache."""
-        if self.redis_client:
-            try:
-                self.redis_client.flushdb()
-                logger.info("Cleared Redis query cache.")
-                return True
-            except Exception as e:
-                logger.error(f"Failed to clear Redis cache: {e}")
-                return False
-        return True
+        """Delete this application's cache entries only (never the whole Redis database)."""
+        if not self.redis_client:
+            return True
+        try:
+            for key in self.redis_client.scan_iter(match=f"{KEY_PREFIX}*", count=500):
+                self.redis_client.delete(key)
+            logger.info("Cleared RAG response cache.")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to clear Redis cache: {e}")
+            return False
 
     def get_stats(self) -> Dict[str, Any]:
         """Return cache performance metrics."""
         total = self.hits + self.misses
-        hit_rate = round((self.hits / total * 100), 2) if total > 0 else 0.0
         return {
             "enabled": self.enabled and (self.redis_client is not None),
             "redis_connected": self.redis_client is not None,
             "hits": self.hits,
             "misses": self.misses,
             "total_requests": total,
-            "hit_rate_pct": hit_rate,
+            "hit_rate_pct": round((self.hits / total * 100), 2) if total > 0 else 0.0,
         }
 
 
 cache_service = RedisCacheService()
-

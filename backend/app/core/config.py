@@ -1,45 +1,55 @@
 import os
 from typing import List
 from dotenv import load_dotenv
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Compute absolute path to backend/app/.env and load with override=True
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ENV_FILE_PATH = os.path.join(BASE_DIR, ".env")
 
-if os.path.exists(ENV_FILE_PATH):
+# Tests set their own environment and must not be changed by a developer's local .env.
+if os.environ.get("ENVIRONMENT", "").lower() != "test" and os.path.exists(ENV_FILE_PATH):
     load_dotenv(ENV_FILE_PATH, override=True)
+
+# The key that ships in the example files. It is public, so it must never sign tokens in production.
+DEFAULT_SECRET_KEY = "dev-secret-key-change-in-production-min-32-characters"
 
 
 class Settings(BaseSettings):
     PROJECT_NAME: str = "RAG Intelligence Platform"
     API_V1_STR: str = "/api/v1"
-    
+
+    # "development" (default), "test" or "production". Production refuses to start with insecure settings.
+    ENVIRONMENT: str = "development"
+
     # Security
-    SECRET_KEY: str = "dev-secret-key-change-in-production-min-32-characters"
+    SECRET_KEY: str = DEFAULT_SECRET_KEY
     ALGORITHM: str = "HS256"
-    ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24 * 7  # 7 days
-    
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24  # 24 hours
+
     # Database
     DATABASE_URL: str = "sqlite+aiosqlite:///./app.db"
-    
+
     # LLM Settings
     DEFAULT_LLM_PROVIDER: str = "groq"
     DEFAULT_LLM_MODEL: str = "llama-3.3-70b-versatile"
-    LLM_TEMPERATURE: float = 0.7
+    # Models tried, in order, when the requested one is unavailable (comma separated).
+    LLM_FALLBACK_MODELS: str = "llama-3.3-70b-versatile,llama-3.1-8b-instant"
+    LLM_TEMPERATURE: float = 0.2  # low: answers should stay close to the retrieved context
     LLM_MAX_TOKENS: int = 4096
     LLM_TIMEOUT: int = 60
-    
+
     # Provider API Keys
     GROQ_API_KEY: str = ""
     OPENAI_API_KEY: str = ""
     GEMINI_API_KEY: str = ""
-    
+
     # RAG Settings
     EMBEDDING_MODEL_NAME: str = "all-MiniLM-L6-v2"
     RERANKER_MODEL_NAME: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
     FAISS_INDEX_PATH: str = "data/faiss.index"
-    FAISS_DOCS_PATH: str = "data/documents.npy"
+    FAISS_DOCS_PATH: str = "data/documents.json"
     RAG_TOP_K: int = 4
     DEFAULT_RETRIEVAL_MODE: str = "hybrid"  # vector, bm25, hybrid
     ENABLE_RERANKER: bool = False
@@ -47,18 +57,24 @@ class Settings(BaseSettings):
     CHUNK_STRATEGY: str = "word"  # word, sentence, paragraph
     CHUNK_SIZE: int = 200
     CHUNK_OVERLAP: int = 40
-    
+
+    # Uploads
+    MAX_UPLOAD_MB: int = 10
+    MAX_PDF_PAGES: int = 500
+
     # Redis & Cache Settings
     REDIS_URL: str = "redis://localhost:6379/0"
     CACHE_ENABLED: bool = True
     CACHE_TTL_SECONDS: int = 3600
-    
+
     # Prompt Versioning
     DEFAULT_PROMPT_VERSION: str = "v1.0"
-    
+
     # Rate Limiting
     RATE_LIMIT_PER_MINUTE: str = "60/minute"
-    
+    AUTH_RATE_LIMIT: str = "10/minute"
+    EVAL_RATE_LIMIT: str = "6/minute"
+
     # CORS Origins
     CORS_ORIGINS: List[str] = [
         "http://localhost:5173",
@@ -67,12 +83,35 @@ class Settings(BaseSettings):
         "http://127.0.0.1:3000",
     ]
 
+    # Directory with the built frontend (served at "/" when it exists, as in the Docker image)
+    FRONTEND_DIST: str = ""
+
     model_config = SettingsConfigDict(
         env_file=ENV_FILE_PATH,
         env_file_encoding="utf-8",
         extra="ignore",
         case_sensitive=True,
     )
+
+    @property
+    def is_production(self) -> bool:
+        return self.ENVIRONMENT.lower() == "production"
+
+    @property
+    def llm_fallback_models(self) -> List[str]:
+        return [m.strip() for m in self.LLM_FALLBACK_MODELS.split(",") if m.strip()]
+
+    @model_validator(mode="after")
+    def _refuse_insecure_production(self) -> "Settings":
+        if self.is_production:
+            if self.SECRET_KEY == DEFAULT_SECRET_KEY or len(self.SECRET_KEY) < 32:
+                raise ValueError(
+                    "SECRET_KEY must be set to a unique random value of at least 32 characters when "
+                    "ENVIRONMENT=production (the default key is public)."
+                )
+            if "*" in self.CORS_ORIGINS:
+                raise ValueError("CORS_ORIGINS must list explicit origins in production, not '*'.")
+        return self
 
 
 settings = Settings()

@@ -1,3 +1,4 @@
+import json
 import os
 import re
 import time
@@ -8,9 +9,11 @@ import faiss
 from sentence_transformers import SentenceTransformer
 
 try:
-    from rank_bm25 import BM25Okapi
+    # BM25+ rather than BM25Okapi: Okapi gives a *negative* weight to any word that appears in more than half of
+    # the documents, so on the small per-session corpora here (often a single uploaded file) it returned nothing.
+    from rank_bm25 import BM25Plus
 except ImportError:
-    BM25Okapi = None
+    BM25Plus = None
 
 from app.core.config import settings
 from app.core.logging import logger
@@ -19,26 +22,42 @@ from app.services.reranker_service import reranker_service
 from app.services.query_service import query_service
 from app.services.cache_service import cache_service
 
+_TOKEN = re.compile(r"\w+")
+
+
+def tokenize(text: str) -> List[str]:
+    """Lower-cased word tokens (punctuation is not part of a word, so "index," matches "index")."""
+    return _TOKEN.findall(text.lower())
 
 
 class RAGService:
-    """Modular, high-performance production RAG service.
-    
+    """Modular RAG retrieval service.
+
     Supports:
     - Vector search (FAISS)
     - BM25 keyword search
     - Reciprocal Rank Fusion (RRF) Hybrid Retrieval
     - Cross-Encoder Reranking
     - Configurable chunking (Word, Sentence, Paragraph)
-    - Microsecond per-stage latency measurement
+    - Per-stage latency measurement
+
+    Scoping: every chunk carries a `session_id`. A chunk with `session_id=None` belongs to the shared knowledge
+    base and is visible to everyone; any other chunk is visible only to retrieval for that session. The scope is
+    applied *before* ranking (inside FAISS and on the BM25 scores), so a busy index never crowds out the
+    caller's own documents.
     """
 
     def __init__(self):
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
         self.embedding_model = None
         self.index = None
-        self.bm25_index = None
         self.documents: List[Dict[str, Any]] = []
+        # BM25 statistics (document frequencies) must come from the chunks a caller may see, never from other
+        # people's documents, so there is one small BM25 index per scope, rebuilt lazily when the content changes.
+        self._bm25_cache: Dict[Tuple[Optional[str], bool], Tuple[int, List[int], Any]] = {}
+        # Bumped whenever the indexed content changes; part of the response-cache key so a cached answer
+        # can never outlive the documents it was computed from.
+        self.version = 0
 
         self.index_file = settings.FAISS_INDEX_PATH
         self.docs_file = settings.FAISS_DOCS_PATH
@@ -48,7 +67,7 @@ class RAGService:
         self._load_index()
 
     def _ensure_storage_dir(self):
-        os.makedirs(os.path.dirname(self.index_file), exist_ok=True)
+        os.makedirs(os.path.dirname(os.path.abspath(self.index_file)), exist_ok=True)
 
     def _load_embedding_model(self):
         try:
@@ -58,43 +77,79 @@ class RAGService:
             logger.error(f"Failed to load embedding model: {e}")
             self.embedding_model = None
 
-    def _build_bm25_index(self):
-        """Construct BM25 index over currently registered document chunks."""
-        if not self.documents or BM25Okapi is None:
-            self.bm25_index = None
-            return
+    def _require_model(self):
+        if self.embedding_model is None:
+            self._load_embedding_model()
+        if self.embedding_model is None:
+            raise RuntimeError("Embedding model is not available.")
+        return self.embedding_model
 
-        try:
-            corpus = [doc["text"].lower().split() for doc in self.documents]
-            self.bm25_index = BM25Okapi(corpus)
-            logger.info(f"Built BM25 index over {len(self.documents)} document chunks.")
-        except Exception as e:
-            logger.error(f"Failed to build BM25 index: {e}")
-            self.bm25_index = None
+    def _embed(self, texts: List[str]) -> np.ndarray:
+        embeddings = np.asarray(self._require_model().encode(texts), dtype="float32")
+        norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        return embeddings / norms
+
+    # ------------------------------------------------------------------ persistence
+    def _persist(self):
+        """Write the index and the chunk metadata. Metadata is JSON (never pickle), written atomically."""
+        if self.index is None:
+            return
+        faiss.write_index(self.index, self.index_file)
+        tmp = f"{self.docs_file}.tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(self.documents, fh)
+        os.replace(tmp, self.docs_file)
+
+    def _legacy_docs_file(self) -> str:
+        return os.path.splitext(self.docs_file)[0] + ".npy"
+
+    def _read_documents(self) -> Optional[List[Any]]:
+        if os.path.exists(self.docs_file):
+            with open(self.docs_file, "r", encoding="utf-8") as fh:
+                return json.load(fh)
+        legacy = self._legacy_docs_file()
+        if os.path.exists(legacy):
+            # Older versions saved a pickled numpy array. Unpickling can execute code, so this is read once, only
+            # from the local data directory, and immediately converted to JSON.
+            logger.warning(f"Migrating legacy pickled document store '{legacy}' to JSON.")
+            return list(np.load(legacy, allow_pickle=True))
+        return None
 
     def _load_index(self):
         with self.lock:
-            if os.path.exists(self.index_file) and os.path.exists(self.docs_file):
-                try:
-                    self.index = faiss.read_index(self.index_file)
-                    raw_docs = np.load(self.docs_file, allow_pickle=True)
-                    self.documents = []
-                    for doc in list(raw_docs):
-                        if isinstance(doc, dict):
-                            self.documents.append(doc)
-                        else:
-                            self.documents.append({
-                                "text": str(doc),
-                                "doc_name": "Knowledge Base",
-                                "chunk_id": len(self.documents)
-                            })
-                    logger.info(f"Loaded FAISS index with {self.index.ntotal} vectors and {len(self.documents)} documents.")
-                    self._build_bm25_index()
-                except Exception as e:
-                    logger.warning(f"Failed to load FAISS index: {e}")
-                    self.index = None
-                    self.documents = []
+            if not os.path.exists(self.index_file):
+                return
+            try:
+                raw_docs = self._read_documents()
+                if raw_docs is None:
+                    return
+                self.index = faiss.read_index(self.index_file)
+                self.documents = []
+                for doc in raw_docs:
+                    if isinstance(doc, dict):
+                        self.documents.append(doc)
+                    else:
+                        self.documents.append({
+                            "text": str(doc),
+                            "doc_name": "Knowledge Base",
+                            "chunk_id": len(self.documents),
+                            "session_id": None,
+                        })
+                if self.index.ntotal != len(self.documents):
+                    raise ValueError(
+                        f"index has {self.index.ntotal} vectors but {len(self.documents)} chunk records"
+                    )
+                if not os.path.exists(self.docs_file):
+                    self._persist()  # completes the legacy migration
+                logger.info(f"Loaded FAISS index with {self.index.ntotal} vectors.")
+                self.version += 1
+            except Exception as e:
+                logger.warning(f"Failed to load FAISS index: {e}")
+                self.index = None
+                self.documents = []
 
+    # ------------------------------------------------------------------ chunking
     def chunk_text(
         self,
         text: str,
@@ -107,8 +162,9 @@ class RAGService:
             return []
 
         strat = strategy or settings.CHUNK_STRATEGY
-        size = chunk_size or settings.CHUNK_SIZE
-        step_overlap = overlap or settings.CHUNK_OVERLAP
+        size = chunk_size if chunk_size is not None else settings.CHUNK_SIZE
+        step_overlap = overlap if overlap is not None else settings.CHUNK_OVERLAP
+        step_overlap = max(0, min(step_overlap, size - 1))
 
         if strat == "sentence":
             sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
@@ -147,8 +203,11 @@ class RAGService:
                 chunk = " ".join(words[i : i + size])
                 if chunk.strip():
                     chunks.append(chunk)
+                if i + size >= len(words):
+                    break
             return chunks
 
+    # ------------------------------------------------------------------ ingestion
     def add_document(
         self,
         text: str,
@@ -158,7 +217,7 @@ class RAGService:
         chunk_overlap: int = None,
         session_id: Optional[str] = None
     ) -> int:
-        """Process document into chunks, generate embeddings, insert into FAISS & BM25, and persist."""
+        """Process document into chunks, embed, insert into FAISS & BM25, and persist. Returns chunk count."""
         if not text or not text.strip():
             return 0
 
@@ -168,21 +227,14 @@ class RAGService:
         if not chunks:
             return 0
 
-        if self.embedding_model is None:
-            self._load_embedding_model()
-
-        embeddings = self.embedding_model.encode(chunks)
-        norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
-        norms[norms == 0] = 1.0
-        embeddings = embeddings / norms
+        embeddings = self._embed(chunks)  # CPU heavy: done outside the lock
 
         with self.lock:
             if self.index is None:
-                dimension = embeddings.shape[1]
-                self.index = faiss.IndexFlatIP(dimension)
+                self.index = faiss.IndexFlatIP(embeddings.shape[1])
 
             start_idx = len(self.documents)
-            self.index.add(np.array(embeddings).astype("float32"))
+            self.index.add(embeddings)
 
             for idx, chunk in enumerate(chunks):
                 self.documents.append({
@@ -192,52 +244,79 @@ class RAGService:
                     "session_id": session_id
                 })
 
-            faiss.write_index(self.index, self.index_file)
-            np.save(self.docs_file, np.array(self.documents, dtype=object))
-            self._build_bm25_index()
+            self.version += 1
+            self._persist()
+            total = self.index.ntotal
 
-        logger.info(f"Added {len(chunks)} chunks from '{doc_name}' for session '{session_id}' (Total vectors: {self.index.ntotal})")
+        logger.info(f"Added {len(chunks)} chunks from '{doc_name}' for session '{session_id}' (Total vectors: {total})")
         return len(chunks)
 
+    # ------------------------------------------------------------------ search
+    def _allowed_positions(self, session_id: Optional[str], include_shared: bool = True) -> List[int]:
+        """Chunk positions visible to `session_id`: that session's own chunks, plus the shared ones if asked."""
+        return [
+            i for i, d in enumerate(self.documents)
+            if (include_shared and d.get("session_id") is None)
+            or (session_id is not None and d.get("session_id") == session_id)
+        ]
 
-    def _vector_search(self, query: str, top_k: int) -> Tuple[List[int], List[float], float]:
-        """Perform FAISS dense vector search and return (indices, scores, latency)."""
+    def _vector_search(
+        self, query: str, top_k: int, allowed: Optional[List[int]] = None
+    ) -> Tuple[List[int], List[float], float]:
+        """FAISS dense search restricted (inside the search) to `allowed` positions. Returns (indices, scores, latency)."""
         t0 = time.time()
-        if self.index is None or self.index.ntotal == 0 or not self.documents:
-            return [], [], 0.0
+        query_embedding = self._embed([query])  # outside the lock
 
-        if self.embedding_model is None:
-            self._load_embedding_model()
+        with self.lock:
+            if self.index is None or self.index.ntotal == 0 or not self.documents:
+                return [], [], 0.0
+            if allowed is not None and not allowed:
+                return [], [], 0.0
 
-        query_embedding = self.embedding_model.encode([query])
-        norm = np.linalg.norm(query_embedding, axis=1, keepdims=True)
-        if norm[0][0] > 0:
-            query_embedding = query_embedding / norm
+            candidate_count = len(allowed) if allowed is not None else self.index.ntotal
+            k = min(top_k, candidate_count)
+            if allowed is not None and candidate_count < self.index.ntotal:
+                params = faiss.SearchParameters()
+                params.sel = faiss.IDSelectorBatch(np.asarray(allowed, dtype=np.int64))
+                distances, indices = self.index.search(query_embedding, k, params=params)
+            else:
+                distances, indices = self.index.search(query_embedding, k)
 
-        distances, indices = self.index.search(
-            np.array(query_embedding).astype("float32"), min(top_k, self.index.ntotal)
-        )
         latency = round(time.time() - t0, 4)
+        pairs = [(int(i), float(s)) for i, s in zip(indices[0], distances[0]) if i >= 0]
+        return [i for i, _ in pairs], [s for _, s in pairs], latency
 
-        if len(indices) > 0:
-            return list(indices[0]), [float(s) for s in distances[0]], latency
-        return [], [], latency
+    def _scoped_bm25(self, session_id: Optional[str], include_shared: bool, allowed: List[int]):
+        """BM25 index over exactly the `allowed` chunks, cached until the index content changes (caller holds the lock)."""
+        key = (session_id, include_shared)
+        cached = self._bm25_cache.get(key)
+        if cached and cached[0] == self.version:
+            return cached[1], cached[2]
+        bm25 = None
+        if allowed and BM25Plus is not None:
+            try:
+                bm25 = BM25Plus([tokenize(self.documents[i]["text"]) for i in allowed])
+            except Exception as e:
+                logger.error(f"Failed to build BM25 index: {e}")
+        if len(self._bm25_cache) >= 32:
+            self._bm25_cache.pop(next(iter(self._bm25_cache)))
+        self._bm25_cache[key] = (self.version, list(allowed), bm25)
+        return list(allowed), bm25
 
-    def _bm25_search(self, query: str, top_k: int) -> Tuple[List[int], List[float], float]:
-        """Perform BM25 sparse keyword search and return (indices, scores, latency)."""
+    def _bm25_search(
+        self, query: str, top_k: int, allowed: List[int], session_id: Optional[str] = None, include_shared: bool = True
+    ) -> Tuple[List[int], List[float], float]:
+        """BM25 search over the `allowed` chunks only. Returns (document positions, scores, latency)."""
         t0 = time.time()
-        if self.bm25_index is None or not self.documents:
-            return [], [], 0.0
+        with self.lock:
+            positions, bm25 = self._scoped_bm25(session_id, include_shared, allowed)
+            if bm25 is None or not positions:
+                return [], [], 0.0
+            scores = np.asarray(bm25.get_scores(tokenize(query)), dtype="float64")
 
-        tokenized_query = query.lower().split()
-        scores = self.bm25_index.get_scores(tokenized_query)
-        top_indices = np.argsort(scores)[::-1][:top_k]
-
-        valid_indices = [int(idx) for idx in top_indices if scores[idx] > 0]
-        valid_scores = [float(scores[idx]) for idx in valid_indices]
-        latency = round(time.time() - t0, 4)
-
-        return valid_indices, valid_scores, latency
+        order = np.argsort(scores)[::-1][:top_k]
+        valid = [int(i) for i in order if scores[i] > 0]
+        return [positions[i] for i in valid], [float(scores[i]) for i in valid], round(time.time() - t0, 4)
 
     def _rrf_fuse(
         self, vector_indices: List[int], bm25_indices: List[int], rrf_k: int = 60
@@ -251,8 +330,7 @@ class RAGService:
         for rank, doc_idx in enumerate(bm25_indices):
             rrf_scores[doc_idx] = rrf_scores.get(doc_idx, 0.0) + (1.0 / (rrf_k + rank + 1))
 
-        fused = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
-        return fused
+        return sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
 
     def retrieve(
         self,
@@ -260,10 +338,15 @@ class RAGService:
         top_k: int = None,
         retrieval_mode: str = None,
         use_reranker: bool = None,
-        session_id: Optional[str] = None
+        session_id: Optional[str] = None,
+        include_shared: bool = True,
     ) -> Tuple[List[SourceCitation], str, Dict[str, float]]:
-        """Execute complete retrieval pipeline with per-stage latency profiling.
-        
+        """Execute the complete retrieval pipeline with per-stage latency profiling.
+
+        `session_id=None` searches the shared knowledge base only; a session id also includes that session's
+        own uploads. `include_shared=False` restricts the search to that session's chunks alone (used by the
+        benchmark so user data cannot change its results).
+
         Returns:
             (citations, formatted_context, latency_breakdown)
         """
@@ -273,48 +356,37 @@ class RAGService:
         rerank = use_reranker if use_reranker is not None else settings.ENABLE_RERANKER
 
         cleaned_query = query_service.clean_query(query)
-        candidate_docs: List[Dict[str, Any]] = []
+        with self.lock:
+            allowed = self._allowed_positions(session_id, include_shared)
 
         vector_indices, vector_scores, vec_latency = [], [], 0.0
         bm25_indices, bm25_scores, bm25_latency = [], [], 0.0
-        hybrid_latency, reranker_latency = 0.0, 0.0
 
         if mode in ("vector", "hybrid"):
-            vector_indices, vector_scores, vec_latency = self._vector_search(cleaned_query, top_k=k * 2)
-
+            vector_indices, vector_scores, vec_latency = self._vector_search(cleaned_query, k * 2, allowed)
         if mode in ("bm25", "hybrid"):
-            bm25_indices, bm25_scores, bm25_latency = self._bm25_search(cleaned_query, top_k=k * 2)
+            bm25_indices, bm25_scores, bm25_latency = self._bm25_search(
+                cleaned_query, k * 2, allowed, session_id, include_shared
+            )
 
         t_h0 = time.time()
         if mode == "vector":
-            for idx, score in zip(vector_indices, vector_scores):
-                if 0 <= idx < len(self.documents):
-                    doc = dict(self.documents[idx])
-                    doc["score"] = score
-                    candidate_docs.append(doc)
+            ranked = list(zip(vector_indices, vector_scores))
         elif mode == "bm25":
-            for idx, score in zip(bm25_indices, bm25_scores):
-                if 0 <= idx < len(self.documents):
-                    doc = dict(self.documents[idx])
-                    doc["score"] = score
-                    candidate_docs.append(doc)
+            ranked = list(zip(bm25_indices, bm25_scores))
         else:  # hybrid
-            fused = self._rrf_fuse(vector_indices, bm25_indices, rrf_k=settings.RRF_K)
-            for doc_idx, score in fused:
-                if 0 <= doc_idx < len(self.documents):
-                    doc = dict(self.documents[doc_idx])
-                    doc["score"] = score
-                    candidate_docs.append(doc)
+            ranked = self._rrf_fuse(vector_indices, bm25_indices, rrf_k=settings.RRF_K)
         hybrid_latency = round(time.time() - t_h0, 4)
 
-        # Filter documents by session_id if scoped retrieval is requested
-        if session_id:
-            candidate_docs = [
-                d for d in candidate_docs
-                if d.get("session_id") is None or d.get("session_id") == session_id
-            ]
+        candidate_docs: List[Dict[str, Any]] = []
+        with self.lock:
+            for idx, score in ranked:
+                if 0 <= idx < len(self.documents):
+                    doc = dict(self.documents[idx])
+                    doc["score"] = score
+                    candidate_docs.append(doc)
 
-        # Reranking Stage
+        reranker_latency = 0.0
         if rerank and candidate_docs:
             t_r0 = time.time()
             reranked = reranker_service.rerank(cleaned_query, candidate_docs, top_n=k)
@@ -326,68 +398,70 @@ class RAGService:
         else:
             candidate_docs = candidate_docs[:k]
 
-
-        # Build Citations and Context Snippets
         citations: List[SourceCitation] = []
         context_snippets: List[str] = []
-
         for idx_rank, doc in enumerate(candidate_docs):
-            score = float(doc.get("score", 0.0))
             citation = SourceCitation(
                 id=idx_rank + 1,
                 text=doc["text"],
-                score=round(score, 4),
+                score=round(float(doc.get("score", 0.0)), 4),
                 source_doc=doc.get("doc_name", "Document")
             )
             citations.append(citation)
             context_snippets.append(f"[{idx_rank + 1}] (Source: {citation.source_doc}): {doc['text']}")
-
-        combined_context = "\n\n".join(context_snippets)
-        total_latency = round(time.time() - start_time, 4)
 
         latency_breakdown = {
             "vector_search_latency": vec_latency,
             "bm25_search_latency": bm25_latency,
             "hybrid_latency": hybrid_latency,
             "reranker_latency": reranker_latency,
-            "total_retrieval_latency": total_latency
+            "total_retrieval_latency": round(time.time() - start_time, 4)
         }
+        return citations, "\n\n".join(context_snippets), latency_breakdown
 
-        return citations, combined_context, latency_breakdown
+    # ------------------------------------------------------------------ removal
+    def clear_index(self, session_id: Optional[str] = None, everything: bool = False) -> int:
+        """Remove chunks and return how many were removed.
 
-    def clear_index(self, session_id: Optional[str] = None) -> bool:
-        """Clear vector store index and document memory. If session_id is provided, removes only chunks for that session."""
+        * `session_id` given: only that session's uploads.
+        * `session_id=None`: only the shared knowledge base.
+        * `everything=True`: all chunks (administrative use).
+
+        The surviving vectors are copied out of the existing index, so nothing is re-embedded.
+        """
         with self.lock:
-            if session_id:
-                self.documents = [d for d in self.documents if d.get("session_id") != session_id]
-            else:
-                self.documents = []
+            if self.index is None or not self.documents:
+                return 0
 
-            if self.documents and self.embedding_model:
-                texts = [d["text"] for d in self.documents]
-                embeddings = self.embedding_model.encode(texts)
-                norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
-                norms[norms == 0] = 1.0
-                embeddings = embeddings / norms
-                dimension = embeddings.shape[1]
-                self.index = faiss.IndexFlatIP(dimension)
-                self.index.add(np.array(embeddings).astype("float32"))
-                faiss.write_index(self.index, self.index_file)
-                np.save(self.docs_file, np.array(self.documents, dtype=object))
-                self._build_bm25_index()
+            if everything:
+                keep = []
+            else:
+                keep = [i for i, d in enumerate(self.documents) if d.get("session_id") != session_id]
+
+            removed = len(self.documents) - len(keep)
+            if removed == 0:
+                return 0
+
+            if keep:
+                vectors = np.vstack([self.index.reconstruct(i) for i in keep]).astype("float32")
+                new_index = faiss.IndexFlatIP(vectors.shape[1])
+                new_index.add(vectors)
+                self.index = new_index
+                self.documents = [self.documents[i] for i in keep]
+                for new_pos, doc in enumerate(self.documents):
+                    doc["chunk_id"] = new_pos
+                self._persist()
             else:
                 self.index = None
-                self.bm25_index = None
                 self.documents = []
-                if os.path.exists(self.index_file):
-                    os.remove(self.index_file)
-                if os.path.exists(self.docs_file):
-                    os.remove(self.docs_file)
-        cache_service.clear_cache()
-        logger.info(f"Cleared vector store index (session_id={session_id})")
-        return True
+                for path in (self.index_file, self.docs_file, self._legacy_docs_file()):
+                    if os.path.exists(path):
+                        os.remove(path)
 
+            self.version += 1
+
+        logger.info(f"Removed {removed} chunks (session_id={session_id}, everything={everything})")
+        return removed
 
 
 rag_service = RAGService()
-

@@ -1,18 +1,22 @@
 from abc import ABC, abstractmethod
-from typing import List, Dict, Generator, Any
+from typing import List, Dict, Generator
 import time
 from app.core.config import settings
 from app.core.logging import logger
 from app.core.exceptions import LLMProviderError
 
 try:
+    import groq
     from groq import Groq
 except ImportError:
+    groq = None
     Groq = None
 
 
 class BaseLLMProvider(ABC):
     """Abstract interface for LLM provider adapters."""
+
+    name = "base"
 
     @abstractmethod
     def generate(
@@ -36,7 +40,9 @@ class BaseLLMProvider(ABC):
 
 
 class MockLLMProvider(BaseLLMProvider):
-    """Fallback LLM provider used when external API keys are invalid/missing or for offline testing."""
+    """Deterministic offline provider. Used only when asked for ("mock") or when no API key is configured."""
+
+    name = "mock"
 
     def generate(
         self,
@@ -47,10 +53,9 @@ class MockLLMProvider(BaseLLMProvider):
     ) -> str:
         last_msg = messages[-1]["content"] if messages else ""
         return (
-            f"[AI Assistant Platform Response]\n\n"
-            f"I analyzed your request regarding: '{last_msg[:120]}...'\n\n"
-            "Here is the context-grounded explanation based on retrieved knowledge base records. "
-            "To connect live Groq API completions, ensure your `GROQ_API_KEY` is configured in `backend/app/.env`."
+            f"[Mock provider: no language model was called]\n\n"
+            f"Your request: '{last_msg[:120]}...'\n\n"
+            "Set GROQ_API_KEY in backend/app/.env to get real answers."
         )
 
     def generate_stream(
@@ -60,22 +65,31 @@ class MockLLMProvider(BaseLLMProvider):
         temperature: float = None,
         max_tokens: int = None
     ) -> Generator[str, None, None]:
-        full_text = self.generate(messages, model, temperature, max_tokens)
-        words = full_text.split(" ")
-        for word in words:
+        for word in self.generate(messages, model, temperature, max_tokens).split(" "):
             yield word + " "
-            time.sleep(0.03)
+            time.sleep(0.01)
+
+
+def _is_model_unavailable(exc: Exception) -> bool:
+    """The requested model does not exist, was retired, or the request was rejected for that model."""
+    if groq is None:
+        return False
+    return isinstance(exc, (groq.NotFoundError, groq.BadRequestError))
+
+
+def _is_retryable_on_other_model(exc: Exception) -> bool:
+    """A different model may succeed: it is unavailable, or this model's own quota is exhausted."""
+    return _is_model_unavailable(exc) or (groq is not None and isinstance(exc, groq.RateLimitError))
 
 
 class GroqProvider(BaseLLMProvider):
-    """Groq API provider adapter with automatic model detection & fallback."""
+    """Groq API provider with fallback across models.
 
-    FALLBACK_MODELS = [
-        "llama-3.3-70b-versatile",
-        "llama-3.1-8b-instant",
-        "mixtral-8x7b-32768",
-        "gemma2-9b-it",
-    ]
+    Failures are surfaced, never disguised: an invalid key, a network error, or every model failing raises an
+    LLMProviderError (HTTP 502) instead of quietly returning a fake answer.
+    """
+
+    name = "groq"
 
     def __init__(self, api_key: str = None):
         key = api_key or settings.GROQ_API_KEY
@@ -85,7 +99,19 @@ class GroqProvider(BaseLLMProvider):
             raise LLMProviderError("groq python package not installed.")
         self.client = Groq(api_key=key)
         self.default_model = settings.DEFAULT_LLM_MODEL
-        self.fallback = MockLLMProvider()
+
+    def _models_to_try(self, requested: str = None) -> List[str]:
+        first = requested or self.default_model
+        return [first] + [m for m in settings.llm_fallback_models if m != first]
+
+    def _explain(self, exc: Exception) -> LLMProviderError:
+        if groq is not None and isinstance(exc, groq.AuthenticationError):
+            return LLMProviderError("the Groq API key was rejected. Check GROQ_API_KEY.")
+        if groq is not None and isinstance(exc, groq.RateLimitError):
+            return LLMProviderError("Groq rate limit reached on every available model. Try again shortly.")
+        if groq is not None and isinstance(exc, (groq.APIConnectionError, groq.APITimeoutError)):
+            return LLMProviderError("could not reach Groq (network error or timeout).")
+        return LLMProviderError("the model request failed.")
 
     def generate(
         self,
@@ -94,14 +120,13 @@ class GroqProvider(BaseLLMProvider):
         temperature: float = None,
         max_tokens: int = None
     ) -> str:
-        requested = model or self.default_model
-        models_to_try = [requested] + [m for m in self.FALLBACK_MODELS if m != requested]
         temp = temperature if temperature is not None else settings.LLM_TEMPERATURE
         max_tok = max_tokens or settings.LLM_MAX_TOKENS
+        last_error: Exception = None
 
-        for target_model in models_to_try:
+        for target_model in self._models_to_try(model):
             try:
-                logger.info(f"Invoking Groq API model '{target_model}'")
+                logger.info(f"Invoking Groq model '{target_model}'")
                 response = self.client.chat.completions.create(
                     model=target_model,
                     messages=messages,
@@ -111,20 +136,14 @@ class GroqProvider(BaseLLMProvider):
                 )
                 return response.choices[0].message.content or ""
             except Exception as e:
-                err_str = str(e).lower()
-                if "invalid_api_key" in err_str or "401" in err_str or "authenticationerror" in err_str:
-                    logger.warning("Groq API Key invalid/expired. Falling back to Mock provider.")
-                    return self.fallback.generate(messages, model, temperature, max_tokens)
-                elif any(k in err_str for k in ("model_decommissioned", "model_not_found", "404", "400", "does not exist", "decommissioned")):
-                    logger.warning(f"Groq model '{target_model}' is decommissioned or unavailable ({e}). Trying next fallback model...")
+                last_error = e
+                if _is_retryable_on_other_model(e):
+                    logger.warning(f"Groq model '{target_model}' unavailable ({type(e).__name__}); trying the next model.")
                     continue
-                else:
-                    logger.error(f"Groq generation error with '{target_model}': {e}")
-                    # Try next model before throwing error
-                    continue
+                logger.error(f"Groq generation error with '{target_model}': {type(e).__name__}: {e}")
+                raise self._explain(e) from e
 
-        # If all model attempts fail, return fallback response gracefully
-        return self.fallback.generate(messages, model, temperature, max_tokens)
+        raise self._explain(last_error)
 
     def generate_stream(
         self,
@@ -133,12 +152,12 @@ class GroqProvider(BaseLLMProvider):
         temperature: float = None,
         max_tokens: int = None
     ) -> Generator[str, None, None]:
-        requested = model or self.default_model
-        models_to_try = [requested] + [m for m in self.FALLBACK_MODELS if m != requested]
         temp = temperature if temperature is not None else settings.LLM_TEMPERATURE
         max_tok = max_tokens or settings.LLM_MAX_TOKENS
+        last_error: Exception = None
 
-        for target_model in models_to_try:
+        for target_model in self._models_to_try(model):
+            yielded = False
             try:
                 logger.info(f"Invoking Groq stream model '{target_model}'")
                 stream = self.client.chat.completions.create(
@@ -151,29 +170,23 @@ class GroqProvider(BaseLLMProvider):
                 )
                 for chunk in stream:
                     if chunk.choices and chunk.choices[0].delta.content:
+                        yielded = True
                         yield chunk.choices[0].delta.content
                 return
             except Exception as e:
-                err_str = str(e).lower()
-                if "invalid_api_key" in err_str or "401" in err_str or "authenticationerror" in err_str:
-                    logger.warning("Groq API Key invalid/expired. Streaming fallback.")
-                    for token in self.fallback.generate_stream(messages, model, temperature, max_tokens):
-                        yield token
-                    return
-                elif any(k in err_str for k in ("model_decommissioned", "model_not_found", "404", "400", "does not exist", "decommissioned")):
-                    logger.warning(f"Groq stream model '{target_model}' decommissioned/unavailable. Trying next fallback...")
+                last_error = e
+                # Once text has reached the user, switching model would splice two answers together.
+                if not yielded and _is_retryable_on_other_model(e):
+                    logger.warning(f"Groq stream model '{target_model}' unavailable ({type(e).__name__}); trying the next model.")
                     continue
-                else:
-                    logger.error(f"Groq stream error with '{target_model}': {e}")
-                    continue
+                logger.error(f"Groq stream error with '{target_model}': {type(e).__name__}: {e}")
+                raise self._explain(e) from e
 
-        # Fallback to mock streaming if all models fail
-        for token in self.fallback.generate_stream(messages, model, temperature, max_tokens):
-            yield token
+        raise self._explain(last_error)
 
 
 class LLMProviderFactory:
-    """Factory for selecting and instantiating active LLM provider."""
+    """Factory for selecting and instantiating the active LLM provider."""
 
     @staticmethod
     def get_provider(provider_name: str = None) -> BaseLLMProvider:
@@ -182,14 +195,13 @@ class LLMProviderFactory:
         if name == "mock":
             return MockLLMProvider()
 
-        if name == "groq" and settings.GROQ_API_KEY and not settings.GROQ_API_KEY.startswith("your_"):
-            try:
-                return GroqProvider()
-            except Exception as e:
-                logger.warning(f"Failed to initialize GroqProvider ({e}), falling back to MockLLMProvider")
+        if name == "groq":
+            if not settings.GROQ_API_KEY or settings.GROQ_API_KEY.startswith("your_"):
+                logger.warning("GROQ_API_KEY is not set; using the mock provider.")
                 return MockLLMProvider()
+            return GroqProvider()
 
-        return MockLLMProvider()
+        raise LLMProviderError(f"unknown provider '{name}'. Use 'groq' or 'mock'.")
 
 
 llm_factory = LLMProviderFactory()

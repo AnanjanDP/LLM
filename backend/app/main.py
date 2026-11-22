@@ -1,15 +1,18 @@
 from contextlib import asynccontextmanager
+import os
 import time
 import uuid
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import RequestValidationError
-from slowapi import Limiter, _rate_limit_exceeded_handler
-from slowapi.util import get_remote_address
+from fastapi.staticfiles import StaticFiles
+from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
 
-from app.core.config import settings
+from app.core.config import settings, DEFAULT_SECRET_KEY
 from app.core.database import init_db
+from app.core.limiter import limiter
 from app.core.logging import setup_logging, logger
 from app.core.exceptions import (
     APIException,
@@ -21,14 +24,12 @@ from app.api.v1.router import api_router
 from app.routes import health
 
 
-# Rate limiter configuration
-limiter = Limiter(key_func=get_remote_address, default_limits=[settings.RATE_LIMIT_PER_MINUTE])
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application startup and shutdown events."""
     setup_logging()
+    if settings.SECRET_KEY == DEFAULT_SECRET_KEY:
+        logger.warning("SECRET_KEY is the public default. Fine for local development; never deploy with it.")
     logger.info("Initializing database tables...")
     await init_db()
     logger.info("RAG LLM Engine startup complete.")
@@ -46,13 +47,16 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# Rate limiting: default limits apply to every route through the middleware; sensitive routes add stricter ones.
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+app.add_middleware(SlowAPIMiddleware)
 
 # Register Centralized Exception Handlers
 app.add_exception_handler(APIException, api_exception_handler)
 app.add_exception_handler(RequestValidationError, validation_exception_handler)
 app.add_exception_handler(Exception, unhandled_exception_handler)
+
 
 # Middleware for Request ID & Latency Logging
 @app.middleware("http")
@@ -60,41 +64,42 @@ async def add_request_metadata(request: Request, call_next):
     request_id = str(uuid.uuid4())
     request.state.request_id = request_id
     start_time = time.time()
-    
+
     response = await call_next(request)
-    
+
     process_time = time.time() - start_time
     response.headers["X-Request-ID"] = request_id
     response.headers["X-Process-Time"] = f"{process_time:.4f}s"
-    
+
     logger.info(
         f"[{request.method}] {request.url.path} status={response.status_code} "
         f"latency={process_time:.4f}s req_id={request_id}"
     )
     return response
 
-# Configure CORS Middleware
+
+# CORS: only the origins listed in CORS_ORIGINS. Authentication uses a Bearer header, not cookies.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=settings.CORS_ORIGINS,
     allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
 )
 
-# Include Router v1 (/api/v1)
 app.include_router(api_router, prefix=settings.API_V1_STR)
-
-# Include Legacy / Convenience Routers for Root & Health
 app.include_router(health.router, prefix="/health", tags=["Health Probe"])
-app.include_router(api_router, prefix="")  # Route root endpoints for seamless UI fallback
 
-
-@app.get("/", tags=["Root"])
-def root():
-    return {
-        "name": settings.PROJECT_NAME,
-        "version": "1.0.0",
-        "docs": f"{settings.API_V1_STR}/docs",
-        "status": "running"
-    }
+_frontend_dist = settings.FRONTEND_DIST
+if _frontend_dist and os.path.isfile(os.path.join(_frontend_dist, "index.html")):
+    # The Docker image ships the built frontend; serve it from the same origin as the API.
+    app.mount("/", StaticFiles(directory=_frontend_dist, html=True), name="frontend")
+else:
+    @app.get("/", tags=["Root"])
+    def root():
+        return {
+            "name": settings.PROJECT_NAME,
+            "version": "1.0.0",
+            "docs": f"{settings.API_V1_STR}/docs",
+            "status": "running"
+        }

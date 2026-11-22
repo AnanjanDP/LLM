@@ -12,15 +12,21 @@ from app.schemas.auth import UserCreate, UserLogin, Token, UserOut
 class AuthService:
     """Authentication service handling registration, login, and authorization checks."""
 
+    @staticmethod
+    def _normalise(email: str) -> str:
+        # "Alice@x.com" and "alice@x.com" are the same mailbox: store and compare one spelling.
+        return email.strip().lower()
+
     async def register_user(self, db: AsyncSession, user_in: UserCreate) -> User:
         """Register a new user after checking email uniqueness."""
-        result = await db.execute(select(User).where(User.email == user_in.email))
+        email = self._normalise(user_in.email)
+        result = await db.execute(select(User).where(User.email == email))
         existing_user = result.scalar_one_or_none()
         if existing_user:
             raise APIException(message="User with this email already exists", status_code=400)
 
         hashed_pwd = get_password_hash(user_in.password)
-        new_user = User(email=user_in.email, hashed_password=hashed_pwd)
+        new_user = User(email=email, hashed_password=hashed_pwd)
         db.add(new_user)
         await db.commit()
         await db.refresh(new_user)
@@ -28,7 +34,7 @@ class AuthService:
 
     async def authenticate_user(self, db: AsyncSession, user_in: UserLogin) -> Token:
         """Authenticate user credentials and issue a JWT access token."""
-        result = await db.execute(select(User).where(User.email == user_in.email))
+        result = await db.execute(select(User).where(User.email == self._normalise(user_in.email)))
         user = result.scalar_one_or_none()
         if not user or not verify_password(user_in.password, user.hashed_password):
             raise AuthenticationError("Incorrect email or password")
@@ -48,9 +54,9 @@ async def get_current_user_optional(
     if not authorization or not authorization.startswith("Bearer "):
         return None
 
-    token = authorization.split(" ")[1]
+    token = authorization.split(" ", 1)[1].strip()
     payload = decode_access_token(token)
-    if not payload:
+    if not payload or payload.get("type") != "access":
         return None
 
     user_id = payload.get("sub")

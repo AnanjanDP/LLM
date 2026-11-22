@@ -3,11 +3,13 @@ from pydantic import BaseModel, Field
 
 
 class EvalExperimentRequest(BaseModel):
-    retrieval_mode: str = "hybrid"  # vector, bm25, hybrid
+    retrieval_mode: str = Field("hybrid", pattern="^(vector|bm25|hybrid)$")
     use_reranker: bool = False
-    top_k: int = 4
+    top_k: int = Field(4, ge=1, le=20)
     prompt_version: str = "v1.0"
-    model: Optional[str] = None
+    model: Optional[str] = Field(None, max_length=100)
+    # Needs a real language model (GROQ_API_KEY); without one only retrieval is evaluated.
+    evaluate_generation: bool = True
 
 
 class RetrievalMetricsSchema(BaseModel):
@@ -24,10 +26,11 @@ class RetrievalMetricsSchema(BaseModel):
 
 
 class GenerationMetricsSchema(BaseModel):
-    faithfulness: float
-    answer_relevance: float
-    context_relevance: float
-    answer_correctness: float
+    """Lexical proxies (word overlap). None when generation was not evaluated."""
+    faithfulness: Optional[float] = None
+    answer_relevance: Optional[float] = None
+    context_relevance: Optional[float] = None
+    answer_correctness: Optional[float] = None
 
 
 class PerformanceMetricsSchema(BaseModel):

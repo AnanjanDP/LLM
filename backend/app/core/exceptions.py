@@ -39,7 +39,7 @@ class AuthenticationError(APIException):
 
 
 class NotFoundError(APIException):
-    """Exception raised when a requested resource is missing."""
+    """Exception raised when a requested resource is missing (or not visible to the caller)."""
     def __init__(self, resource: str = "Resource"):
         super().__init__(
             message=f"{resource} not found",
@@ -76,13 +76,16 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 
 
 async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
-    """Global handler for unhandled server exceptions."""
+    """Global handler for unhandled server exceptions.
+
+    The exception text can contain file paths, SQL or secrets, so it goes to the log, not to the client.
+    """
     logger.exception(f"Unhandled Exception path={request.url.path}: {str(exc)}")
     return JSONResponse(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
         content={
             "success": False,
             "error": "An internal server error occurred.",
-            "details": str(exc) if not request.app.debug else str(exc)
+            "details": {},
         }
     )
