@@ -2,7 +2,7 @@
 
 [![FastAPI](https://img.shields.io/badge/Backend-FastAPI-009688?logo=fastapi)](https://fastapi.tiangolo.com)
 [![React 19](https://img.shields.io/badge/Frontend-React%2019-61DAFB?logo=react)](https://react.dev)
-[![Groq](https://img.shields.io/badge/LLM-Groq%20Llama--3.3-orange)](https://groq.com)
+[![Groq](https://img.shields.io/badge/LLM-Groq%20gpt--oss-orange)](https://groq.com)
 [![FAISS](https://img.shields.io/badge/VectorDB-FAISS-blue)](https://github.com/facebookresearch/faiss)
 [![BM25](https://img.shields.io/badge/Search-BM25-green)](https://github.com/dorianbrown/rank_bm25)
 [![Redis](https://img.shields.io/badge/Cache-Redis-red?logo=redis)](https://redis.io)
@@ -47,8 +47,8 @@ FastAPI Gateway (`backend/app/main.py`)
     │     └── Token Accounting & Cost Estimator
     │
     ├── LLM Provider Engine (`app/services/llm_provider.py`)
-    │     ├── Primary: Groq API (`llama-3.3-70b-versatile`)
-    │     ├── Fallback models: llama-3.1-8b-instant (on unavailable / rate-limited)
+    │     ├── Primary: Groq API (`openai/gpt-oss-120b`)
+    │     ├── Fallback model: openai/gpt-oss-20b (on unavailable / rate-limited)
     │     └── Offline mock provider (only when requested or no API key is set)
     │
     └── Evaluation Engine & Metrics Store (`app/services/eval_service.py`)
@@ -70,7 +70,7 @@ FastAPI Gateway (`backend/app/main.py`)
    $$RRF\_Score(d) = \sum_{m \in \{Vector, BM25\}} \frac{1}{k_{rrf} + rank_m(d)}$$
 4. **Cross-Encoder Reranking**: Candidate chunks are scored with `CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')` to re-order context snippets based on deep semantic query-document alignment.
 5. **Context & Prompt Injection**: The top $K$ context snippets are injected into a versioned system prompt (`v1.0`, `v1.1_strict`, or `v2.0_cot`).
-6. **LLM Generation**: Model completion via Groq API (`llama-3.3-70b-versatile`) or SSE streaming.
+6. **LLM Generation**: Model completion via Groq API (`openai/gpt-oss-120b`) or SSE streaming.
 7. **Evaluation & Profiling**: Latency across every pipeline stage (embedding, vector, BM25, hybrid, reranker, LLM) is logged, token usage & estimated USD cost are computed, and real-LLM answers are cached in Redis (the cache key includes the query, mode, model, prompt, settings, session and index version).
 
 ---

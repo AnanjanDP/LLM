@@ -13,7 +13,7 @@ export default function Navbar({
       <div style={{ display: "flex", alignItems: "center", gap: "12px" }}>
         <div className="badge">
           <span className="status-dot"></span>
-          <span>Groq Llama-3.3-70B Active</span>
+          <span>Groq gpt-oss-120b Active</span>
         </div>
         <div style={{ fontSize: "0.8rem", color: "var(--text-dim)" }}>
           Provider: <strong style={{ color: "#a5b4fc" }}>{currentProvider || "groq"}</strong>

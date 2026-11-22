@@ -33,9 +33,9 @@ class Settings(BaseSettings):
 
     # LLM Settings
     DEFAULT_LLM_PROVIDER: str = "groq"
-    DEFAULT_LLM_MODEL: str = "llama-3.3-70b-versatile"
+    DEFAULT_LLM_MODEL: str = "openai/gpt-oss-120b"
     # Models tried, in order, when the requested one is unavailable (comma separated).
-    LLM_FALLBACK_MODELS: str = "llama-3.3-70b-versatile,llama-3.1-8b-instant"
+    LLM_FALLBACK_MODELS: str = "openai/gpt-oss-120b,openai/gpt-oss-20b"
     LLM_TEMPERATURE: float = 0.2  # low: answers should stay close to the retrieved context
     LLM_MAX_TOKENS: int = 4096
     LLM_TIMEOUT: int = 60

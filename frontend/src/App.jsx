@@ -248,7 +248,7 @@ export default function App() {
                 Enterprise RAG & AI Intelligence Engine
               </h2>
               <p style={{ maxWidth: "520px", color: "var(--text-muted)", fontSize: "0.92rem", lineHeight: "1.6" }}>
-                Powered by Groq Llama-3.3, FAISS Vector Similarity Search, Pydantic validation, and SSE streaming. Ask a query below or select a sample prompt to start.
+                Powered by Groq gpt-oss-120b, FAISS Vector Similarity Search, Pydantic validation, and SSE streaming. Ask a query below or select a sample prompt to start.
               </p>
 
               {/* Sample Prompt Suggestion Cards */}
@@ -282,7 +282,7 @@ export default function App() {
           {loading && !stream && (
             <div style={{ display: "flex", alignItems: "center", gap: "8px", color: "var(--text-muted)", fontSize: "0.85rem", padding: "8px 0" }}>
               <Sparkles size={16} className="spin" color="var(--primary)" />
-              <span>Generating response with Groq Llama-3.3...</span>
+              <span>Generating response with Groq gpt-oss-120b...</span>
             </div>
           )}
 

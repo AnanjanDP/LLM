@@ -84,7 +84,7 @@ export default function ChatInput({
                 outline: "none"
               }}
             >
-              <option value="groq">Groq (Llama-3.3)</option>
+              <option value="groq">Groq (gpt-oss-120b)</option>
               <option value="mock">Local Mock Fallback</option>
             </select>
           </div>

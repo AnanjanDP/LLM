@@ -48,6 +48,8 @@ class PromptService:
     }
 
     MODEL_PRICING: Dict[str, Dict[str, float]] = {
+        "openai/gpt-oss-120b": {"input_per_1m": 0.15, "output_per_1m": 0.60},
+        "openai/gpt-oss-20b": {"input_per_1m": 0.075, "output_per_1m": 0.30},
         "llama-3.3-70b-versatile": {"input_per_1m": 0.59, "output_per_1m": 0.79},
         "llama-3.1-8b-instant": {"input_per_1m": 0.05, "output_per_1m": 0.08},
         "mixtral-8x7b-32768": {"input_per_1m": 0.24, "output_per_1m": 0.24},

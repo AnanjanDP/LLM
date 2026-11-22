@@ -26,7 +26,7 @@ Users register with an email and a password that is stored as a bcrypt hash. Log
 
 ## Prompts and language model
 
-Prompts are versioned: a standard grounded prompt, a strict prompt that refuses to answer outside the provided context, and a chain of thought prompt. Answers are generated with Llama 3.3 through the Groq API, with a smaller model as a fallback when the first is unavailable. Token usage and estimated cost are calculated for every response.
+Prompts are versioned: a standard grounded prompt, a strict prompt that refuses to answer outside the provided context, and a chain of thought prompt. Answers are generated with gpt-oss-120b through the Groq API, with a smaller model as a fallback when the first is unavailable. Token usage and estimated cost are calculated for every response.
 
 ## Evaluation
 
